@@ -1,0 +1,251 @@
+// index.ts
+import "dotenv/config";
+import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { setupHandlers } from "./handlers.js";
+
+async function main() {
+  const server = new Server(
+    { name: "github-issues-manager-mcp", version: "1.0.0" },
+    {
+      capabilities: {
+        resources: {},
+        prompts: {},
+        tools: {},
+      },
+    }
+  );
+
+  setupHandlers(server);
+
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+  console.info(
+    JSON.stringify({ jsonrpc: "2.0", method: "log", params: { message: "GitHub Issues MCP Server running..." } })
+  );
+}
+
+main().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
+
+// src/handlers.ts
+import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import {
+  ListResourcesRequestSchema,
+  ReadResourceRequestSchema,
+  ListResourceTemplatesRequestSchema,
+  ListPromptsRequestSchema,
+  GetPromptRequestSchema,
+  ListToolsRequestSchema,
+  CallToolRequestSchema,
+} from "@modelcontextprotocol/sdk/types.js";
+import { prompts, promptHandlers } from "./prompts.js";
+import { tools, toolHandlers } from "./tools.js";
+
+export function setupHandlers(server: Server): void {
+  // Register available resources
+  server.setRequestHandler(ListResourcesRequestSchema, async () => ({
+    resources: [
+      {
+        uri: "resource://issues/list",
+        name: "List Open Issues",
+        description: "Fetches the latest open issues from the configured GitHub repo",
+        mimeType: "application/json",
+      },
+      {
+        uri: "resource://issues/{number}",
+        name: "Get Single Issue",
+        description: "Retrieve a single GitHub issue by its number",
+        mimeType: "application/json",
+      },
+    ],
+  }));
+
+  // Register URI templates for resources
+  server.setRequestHandler(ListResourceTemplatesRequestSchema, async () => ({
+    resourceTemplates: [
+      {
+        uriTemplate: "resource://issues/{number}",
+        name: "Issue by Number",
+        description: "Fetch a specific issue",
+        mimeType: "application/json",
+      },
+    ],
+  }));
+
+  // Handle resource reads
+  server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
+    const { uri } = request.params;
+    if (uri === "resource://issues/list") {
+      return await promptHandlers["resource://issues/list"]();
+    }
+    const match = uri.match(/^resource:\/\/issues\/(\d+)$/);
+    if (match) {
+      const issue_number = parseInt(match[1], 10);
+      return await promptHandlers["resource://issues/{number}"]({ issue_number });
+    }
+    throw new Error(`Resource not found: ${uri}`);
+  });
+
+  // Prompts: list and get
+  server.setRequestHandler(ListPromptsRequestSchema, async () => ({
+    prompts: Object.values(prompts),
+  }));
+
+  server.setRequestHandler(GetPromptRequestSchema, async (request) => {
+    const { name, arguments: args } = request.params;
+    const handler = promptHandlers[name as keyof typeof promptHandlers];
+    if (!handler) throw new Error(`Prompt not found: ${name}`);
+    return handler(args as any);
+  });
+
+  // Tools: list and call
+  server.setRequestHandler(ListToolsRequestSchema, async () => ({
+    tools: Object.values(tools),
+  }));
+
+  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    const { name, arguments: params } = request.params;
+    const handler = toolHandlers[name as keyof typeof toolHandlers];
+    if (!handler) throw new Error(`Tool not found: ${name}`);
+    // @ts-expect-error validated by schema
+    return handler(params);
+  });
+}
+
+// src/prompts.ts
+import { toolHandlers } from "./tools.js";
+
+export const prompts = {
+  "prompt://create-issue": {
+    name: "prompt://create-issue",
+    description: "Generate a prompt to create a GitHub issue",
+    arguments: [
+      { name: "title", description: "Issue title", required: true },
+      { name: "body", description: "Issue body/content", required: true },
+      { name: "labels", description: "Optional labels", required: false },
+    ],
+  },
+  "prompt://comment-issue": {
+    name: "prompt://comment-issue",
+    description: "Generate a prompt to comment on a GitHub issue",
+    arguments: [
+      { name: "issue_number", description: "Target issue number", required: true },
+      { name: "comment", description: "Comment text", required: true },
+    ],
+  },
+};
+
+export const promptHandlers = {
+  "prompt://create-issue": ({ title, body, labels }: { title: string; body: string; labels?: string[] }) => ({
+    messages: [
+      {
+        role: "user",
+        content: {
+          type: "text",
+          text: `Please create an issue titled "${title}" with description "${body}"${labels ? ` and labels ${JSON.stringify(labels)}` : ""}.`,
+        },
+      },
+    ],
+  }),
+
+  "prompt://comment-issue": ({ issue_number, comment }: { issue_number: number; comment: string }) => ({
+    messages: [
+      {
+        role: "user",
+        content: {
+          type: "text",
+          text: `Please add a comment to issue #${issue_number}: "${comment}".`,
+        },
+      },
+    ],
+  }),
+
+  // Resource handlers
+  "resource://issues/list": async () => ({
+    contents: [
+      {
+        uri: "resource://issues/list",
+        text: JSON.stringify(await toolHandlers.listIssues(), null, 2),
+      },
+    ],
+  }),
+
+  "resource://issues/{number}": async ({ issue_number }: { issue_number: number }) => ({
+    contents: [
+      {
+        uri: `resource://issues/${issue_number}`,
+        text: JSON.stringify(await toolHandlers.getIssue(issue_number), null, 2),
+      },
+    ],
+  }),
+};
+
+// src/tools.ts
+import axios from "axios";
+
+const { GITHUB_OWNER, GITHUB_REPO, GITHUB_TOKEN } = process.env;
+if (!GITHUB_OWNER || !GITHUB_REPO || !GITHUB_TOKEN) {
+  throw new Error("GITHUB_OWNER, GITHUB_REPO, and GITHUB_TOKEN must be set in env");
+}
+
+const api = axios.create({
+  baseURL: `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}`,
+  headers: {
+    Authorization: `token ${GITHUB_TOKEN}`,
+    Accept: "application/vnd.github+json",
+  },
+});
+
+export const tools = {
+  "tool://create-issue": {
+    name: "tool://create-issue",
+    description: "Create a new GitHub issue",
+    inputSchema: {
+      type: "object",
+      properties: {
+        title: { type: "string" },
+        body: { type: "string" },
+        labels: { type: "array", items: { type: "string" } },
+      },
+      required: ["title", "body"],
+    },
+  },
+  "tool://comment-issue": {
+    name: "tool://comment-issue",
+    description: "Add a comment to an existing GitHub issue",
+    inputSchema: {
+      type: "object",
+      properties: {
+        issue_number: { type: "number" },
+        comment: { type: "string" },
+      },
+      required: ["issue_number", "comment"],
+    },
+  },
+};
+
+export const toolHandlers = {
+  async "tool://create-issue"({ title, body, labels }: { title: string; body: string; labels?: string[] }) {
+    const resp = await api.post("/issues", { title, body, labels });
+    return { issue_number: resp.data.number, url: resp.data.html_url };
+  },
+
+  async "tool://comment-issue"({ issue_number, comment }: { issue_number: number; comment: string }) {
+    const resp = await api.post(`/issues/${issue_number}/comments`, { body: comment });
+    return { comment_url: resp.data.html_url };
+  },
+
+  // Helpers for resource handlers
+  async listIssues() {
+    const resp = await api.get("/issues", { params: { state: "open" } });
+    return resp.data;
+  },
+
+  async getIssue(issue_number: number) {
+    const resp = await api.get(`/issues/${issue_number}`);
+    return resp.data;
+  },
+};
